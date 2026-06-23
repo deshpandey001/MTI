@@ -15,12 +15,14 @@ files = [
 
 datasets = []
 for f in files:
-    ds = xr.open_dataset(f)
+    ds = xr.open_dataset(f, chunks={"time": -1})
     io = ds.sel(lat=slice(-40, 30), lon=slice(20, 120))
     datasets.append(io)
     ds.close()
 
 ds = xr.concat(datasets, dim="time")
+# Rechunk so each timestep is a single chunk, aligned with stored chunk layout
+ds = ds.chunk({"time": 1})
 print(f"Combined dataset (Indian Ocean): {ds.sizes}")
 
 indian_ocean = ds
@@ -28,11 +30,10 @@ sst = indian_ocean["sst"]
 
 # =============================================================================
 # 2. Compute daily climatology (group by day-of-year)
-#    Note: 2016 is a leap year, so dayofyear runs 1-366.
-#    Feb 29 (day 366) only has 1 sample, but xarray handles this automatically.
 # =============================================================================
 print("\nComputing daily climatology (2015-2017)...")
 climatology = sst.groupby("time.dayofyear").mean(dim="time")
+climatology = climatology.chunk({"lat": -1, "lon": -1})
 print(f"Climatology shape: {climatology.sizes}")
 
 # =============================================================================
@@ -40,7 +41,6 @@ print(f"Climatology shape: {climatology.sizes}")
 # =============================================================================
 print("Computing SST anomalies...")
 anomalies = sst.groupby("time.dayofyear") - climatology
-# Attach the coordinate back for plotting
 anomalies = anomalies.rename("sst_anomaly")
 
 # =============================================================================
@@ -95,13 +95,12 @@ plt.close()
 print("Saved: outputs/anomaly_timeseries.png")
 
 # =============================================================================
-# 6. Identify the warmest anomaly periods (largest positive anomalies)
+# 6. Identify the warmest anomaly periods
 # =============================================================================
 print("\nIdentifying warmest anomaly periods...")
 anomaly_vals = anomaly_ts.values
 anomaly_times = anomaly_ts.time.values
 
-# Top 10 highest anomaly days
 top_n = 10
 top_idx = np.argsort(anomaly_vals)[-top_n:][::-1]
 print(f"\nTop {top_n} warmest anomaly days:")
@@ -113,7 +112,7 @@ for idx in top_idx:
 # =============================================================================
 # 7. Calculate summary statistics
 # =============================================================================
-anom_flat = anomaly_ts.values  # already spatially averaged
+anom_flat = anomaly_ts.values
 max_anom = float(np.max(anom_flat))
 mean_anom = float(np.mean(anom_flat))
 std_anom = float(np.std(anom_flat))
@@ -122,7 +121,6 @@ print(f"  Maximum anomaly:  {max_anom:+.3f} °C")
 print(f"  Mean anomaly:     {mean_anom:+.3f} °C")
 print(f"  Std deviation:    {std_anom:.3f} °C")
 
-# Warmest month per year
 for year in [2015, 2016, 2017]:
     yr_anom = monthly_anomalies.sel(time=str(year))
     yr_mean = yr_anom.mean(dim=["lat", "lon"])
@@ -135,11 +133,11 @@ for year in [2015, 2016, 2017]:
 # 8. Generate a summary report
 # =============================================================================
 report = f"""
-================================================================================
+===============================================================================
                   MARINE HEATWAVE (MHW) ANALYSIS SUMMARY
                   NOAA OISST v2 — Indian Ocean (20°E–120°E, 40°S–30°N)
                   Period: 2015–2017
-================================================================================
+===============================================================================
 
 CLIMATOLOGY:
   Computed as daily mean SST for each calendar day over 2015–2017.
@@ -176,7 +174,7 @@ GENERATED FIGURES:
   3. outputs/sst_differences.png      — Inter-annual SST differences
   4. outputs/anomaly_maps.png         — Anomaly maps for Jan 2015, Jul 2016, Dec 2017
   5. outputs/anomaly_timeseries.png   — Daily anomaly time series
-================================================================================
+===============================================================================
 """
 
 with open("outputs/summary_report.txt", "w") as f:
