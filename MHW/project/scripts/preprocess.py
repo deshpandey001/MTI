@@ -1,57 +1,72 @@
 """
 preprocess.py
 =============
-Research-grade preprocessing pipeline for NOAA OISST v2 and CMIP6
-historical SST datasets.  This script:
+Production-ready preprocessing pipeline for NOAA OISSTv2 and CMIP6 SST.
 
-  • Loads all NetCDF files from ``data/noaa/`` and ``data/cmip6_historical/``
-  • Standardises variable names, coordinates, and units
-  • Converts longitude from 0–360 to –180…180
-  • Subsets the Indian Ocean (20°E–120°E, 40°S–30°N)
-  • Filters physically impossible SST values (–2…40 °C)
-  • Validates time axis (missing / duplicate dates)
-  • Prints a detailed summary report
-  • Saves harmonised files to ``data/processed/``
-  • Generates quick-look figures in ``outputs/preprocessing/``
+Loads NetCDF files, standardises names/coordinates/units, subsets the
+Indian Ocean (20°E–120°E, 40°S–30°N), filters impossible SST values,
+regrids CMIP6 models to a common 0.5° grid, computes summary statistics,
+saves compressed NetCDF to ``data/processed/``, and generates quick-look
+figures in ``outputs/preprocessing/``.
 
 Usage
 -----
-    python scripts/preprocess.py
-
-All configuration is inferred from the project directory structure
-so no command-line arguments are required.
+    python scripts/preprocess.py              # NOAA + CMIP6 historical
+    python scripts/preprocess.py noaa         # NOAA only
+    python scripts/preprocess.py cmip6        # CMIP6 historical only
+    python scripts/preprocess.py cmip6_future # CMIP6 future only
+    python scripts/preprocess.py noaa cmip6 cmip6_future  # all
 """
 
 from __future__ import annotations
 
 import logging
+import os
+import sys
+import tempfile
 import time
+import traceback
 from pathlib import Path
 
+import dask
+import dask.array as da
 import numpy as np
+import pandas as pd
 import xarray as xr
-from dask import compute as dask_compute
 
 # ---------------------------------------------------------------------------
-# Paths  (relative to this script: scripts/ → project root)
+# Paths
 # ---------------------------------------------------------------------------
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = PROJECT_ROOT / "data"
 NOAA_DIR = DATA_DIR / "noaa"
 CMIP6_DIR = DATA_DIR / "cmip6_historical"
+CMIP6_FUTURE_DIR = DATA_DIR / "cmip6_future"
 PROCESSED_DIR = DATA_DIR / "processed"
 FIGURES_DIR = PROJECT_ROOT / "outputs" / "preprocessing"
 
-# Coordinate-name mappings for CMIP6 models
-_COORD_MAP: dict[str, str] = {
+SOURCE_DIR_MAP: dict[str, Path] = {
+    "noaa": NOAA_DIR,
+    "cmip6": CMIP6_DIR,
+    "cmip6_historical": CMIP6_DIR,
+    "cmip6_future": CMIP6_FUTURE_DIR,
+}
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+SST_VARIABLE_NAMES = {"sst", "tos", "thetao"}
+COORD_RENAME_MAP: dict[str, str] = {
     "latitude": "lat",
     "lat": "lat",
     "nav_lat": "lat",
     "longitude": "lon",
     "lon": "lon",
     "nav_lon": "lon",
-    "time": "time",
 }
+INDIAN_OCEAN = dict(lat=slice(-40.0, 30.0), lon=slice(20.0, 120.0))
+SST_RANGE = (-2.0, 40.0)
+CMIP6_TARGET_RESOLUTION = 0.5  # degrees
 
 logger = logging.getLogger("preprocess")
 
@@ -61,7 +76,6 @@ logger = logging.getLogger("preprocess")
 # ===================================================================
 
 def setup_logging() -> None:
-    """Configure a single root-logger for the whole module."""
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s | %(name)-12s | %(levelname)-6s | %(message)s",
@@ -69,17 +83,19 @@ def setup_logging() -> None:
     )
 
 
-def log_step(step_name: str) -> None:
-    """Print a banner marking the start of a processing step."""
+def _log_step(name: str) -> None:
     logger.info("")
     logger.info("=" * 60)
-    logger.info("START  %s", step_name)
+    logger.info("START  %s", name)
     logger.info("=" * 60)
 
 
-def log_done(step_name: str, elapsed: float) -> None:
-    """Mark the end of a step together with wall-clock time."""
-    logger.info("%s  …  done  (%.2f s)", step_name, elapsed)
+def _log_done(name: str, sec: float) -> None:
+    logger.info("%s  …  done  (%.2f s)", name, sec)
+
+
+def _fmt_gb(n_bytes: float) -> str:
+    return f"{n_bytes / (1024 ** 3):.2f} GB"
 
 
 # ===================================================================
@@ -87,13 +103,6 @@ def log_done(step_name: str, elapsed: float) -> None:
 # ===================================================================
 
 def find_netcdf_files(directory: Path) -> list[Path]:
-    """Return a sorted list of all ``.nc`` files under *directory*.
-
-    Raises
-    ------
-    FileNotFoundError
-        If no NetCDF files are found.
-    """
     files = sorted(directory.glob("*.nc"))
     if not files:
         raise FileNotFoundError(f"No NetCDF files found in {directory}")
@@ -102,310 +111,334 @@ def find_netcdf_files(directory: Path) -> list[Path]:
 
 
 # ===================================================================
-#  Dataset loading
-# ===================================================================
-
-def load_noaa_dataset() -> xr.Dataset:
-    """Load all NOAA OISST NetCDF files with dask chunks.
-
-    Each file is opened with time chunks, longitude is converted,
-    and the Indian Ocean subset is applied lazily so that the global
-    grid is never materialised in memory.
-    """
-    t0 = time.perf_counter()
-    files = find_netcdf_files(NOAA_DIR)
-    logger.info("Opening NOAA files with dask …")
-
-    # Open as a single dask-backed dataset
-    ds = xr.open_mfdataset(
-        [str(f) for f in files],
-        combine="by_coords",
-        chunks={"time": 50},
-        data_vars="minimal",
-        coords="minimal",
-        compat="override",
-    )
-
-    # Apply longitude conversion (coordinate-only, cheap)
-    if "lon" in ds.coords and _is_0_360(ds):
-        lon = ds.lon.values  # 1-D coordinate, small
-        ds = ds.assign_coords(lon=((lon + 180) % 360) - 180)
-        ds = ds.sortby("lon")
-
-    # Subset Indian Ocean
-    ds = ds.sel(lat=slice(-40.0, 30.0), lon=slice(20.0, 120.0))
-
-    log_done("Load NOAA dataset", time.perf_counter() - t0)
-    _print_dataset_info(ds, "NOAA OISST")
-    return ds
-
-
-def load_cmip6_dataset() -> xr.Dataset:
-    """Load all CMIP6 NetCDF files, handling mismatched grids gracefully.
-
-    Files that share the same spatial grid are combined via
-    ``open_mfdataset``; otherwise each file is opened individually and
-    re-chunked before being concatenated along ``time``.
-    """
-    t0 = time.perf_counter()
-    files = find_netcdf_files(CMIP6_DIR)
-
-    # Try a single open_mfdataset first (fast path for homogeneous grids)
-    try:
-        ds = xr.open_mfdataset(
-            [str(f) for f in files],
-            combine="by_coords",
-            data_vars="minimal",
-            coords="minimal",
-            compat="override",
-            chunks={"time": 50},
-        )
-        ds = ds.sortby("time")
-        logger.info("All CMIP6 files share the same grid — combined directly.")
-        log_done("Load CMIP6 dataset", time.perf_counter() - t0)
-        _print_dataset_info(ds, "CMIP6 historical")
-        return ds
-    except (ValueError, KeyError):
-        logger.info(
-            "CMIP6 grids differ — loading files individually …"
-        )
-
-    # Fallback: open each file and concatenate along time
-    datasets: list[xr.Dataset] = []
-    for f in files:
-        ds_i = xr.open_dataset(str(f), chunks={"time": 50})
-        # Standardise internal variable name ASAP
-        ds_i = _standardise_variable(ds_i)
-        datasets.append(ds_i)
-
-    # Combine along time — xr.concat will broadcast mismatched
-    # spatial coordinates.
-    ds = xr.concat(datasets, dim="time", coords="minimal", compat="override")
-    ds = ds.sortby("time")
-    log_done("Load CMIP6 dataset (fallback)", time.perf_counter() - t0)
-    _print_dataset_info(ds, "CMIP6 historical")
-    return ds
-
-
-def _print_dataset_info(ds: xr.Dataset, label: str) -> None:
-    """Log the key metadata of a dataset for inspection."""
-    logger.info("─── %s metadata ───", label)
-    logger.info("  Dimensions   : %s", dict(ds.sizes))
-    logger.info("  Coordinates  : %s", list(ds.coords))
-    logger.info("  Data vars    : %s", list(ds.data_vars))
-    if "time" in ds.dims:
-        logger.info(
-            "  Time range   : %s  →  %s",
-            str(ds.time.values.min())[:19],
-            str(ds.time.values.max())[:19],
-        )
-        logger.info("  Time steps   : %d", ds.sizes["time"])
-    logger.info("  Global attrs : %s", _summarise_attrs(ds.attrs))
-
-
-def _summarise_attrs(attrs: dict) -> str:
-    """Short human-readable summary of global attributes."""
-    parts: list[str] = []
-    for key in ("title", "source", "institution", "Conventions"):
-        val = attrs.get(key)
-        if val:
-            parts.append(f"{key}={val}")
-    return "; ".join(parts) if parts else "(none)"
-
-
-# ===================================================================
 #  Variable & coordinate standardisation
 # ===================================================================
 
-def _standardise_variable(ds: xr.Dataset) -> xr.Dataset:
-    """Detect and rename the SST variable to ``sst``.
-
-    Recognised input names: ``sst``, ``tos``, ``thetao``.
-    """
-    sst_names = {"sst", "tos", "thetao"}
-    found = [v for v in ds.data_vars if v in sst_names]
+def standardise_sst_variable(ds: xr.Dataset) -> xr.Dataset:
+    found = [v for v in ds.data_vars if v in SST_VARIABLE_NAMES]
     if not found:
         raise ValueError(
-            f"None of {sst_names} found among data variables {list(ds.data_vars)}"
+            f"None of {SST_VARIABLE_NAMES} found among {list(ds.data_vars)}"
         )
-    if len(found) > 1:
-        logger.warning("Multiple SST-like variables found: %s — using '%s'", found, found[0])
     sst_var = found[0]
-    if sst_var != "sst":
-        ds = ds.rename({sst_var: "sst"})
-    return ds
+    return ds.rename({sst_var: "sst"}) if sst_var != "sst" else ds
 
 
 def standardise_coordinates(ds: xr.Dataset) -> xr.Dataset:
-    """Rename all recognised coordinate names to ``lat`` / ``lon`` / ``time``.
-
-    Also drops auxiliary coords that are not needed downstream.
-    """
     rename = {}
-    for existing_name in list(ds.coords):
-        canonical = _COORD_MAP.get(existing_name)
-        if canonical is not None and existing_name != canonical:
-            rename[existing_name] = canonical
+    for existing in list(ds.coords):
+        canonical = COORD_RENAME_MAP.get(existing)
+        if canonical is not None and existing != canonical:
+            rename[existing] = canonical
     if rename:
-        logger.info("Renaming coordinates: %s", rename)
         ds = ds.rename(rename)
 
-    # Remove spurious 1D bounds / vertex arrays that can confuse later ops
-    drop = [v for v in ds.coords if v not in ("lat", "lon", "time") and v not in ds.dims]
-    if drop:
-        logger.info("Dropping auxiliary coords: %s", drop)
-        ds = ds.drop_vars(drop, errors="ignore")
+    non_essential = [v for v in ds.coords if v not in ("lat", "lon", "time") and v not in ds.dims]
+    if non_essential:
+        ds = ds.drop_vars(non_essential, errors="ignore")
+
     return ds
 
 
-def _guess_lat_lon_dims(ds: xr.Dataset) -> tuple[list[str], list[str]]:
-    """Identify the spatial dimension names for lat / lon.
-
-    Returns
-    -------
-    lat_dims, lon_dims : list of str
-    """
-    lat_candidates = {"lat", "latitude", "nav_lat", "j", "y"}
-    lon_candidates = {"lon", "longitude", "nav_lon", "i", "x"}
-    lat_dims = [d for d in ds.dims if d in lat_candidates]
-    lon_dims = [d for d in ds.dims if d in lon_candidates]
-    return lat_dims, lon_dims
+def _ensure_lat_ascending(ds: xr.Dataset) -> xr.Dataset:
+    if "lat" not in ds.coords or ds.lat.ndim != 1:
+        return ds
+    if float(ds.lat.values[0]) > float(ds.lat.values[-1]):
+        logger.info("  Latitude is descending — reversing")
+        ds = ds.sortby("lat")
+    return ds
 
 
 # ===================================================================
-#  Unit conversion
+#  Unit conversion  (Kelvin → Celsius)
 # ===================================================================
 
 def convert_kelvin_to_celsius(ds: xr.Dataset) -> xr.Dataset:
-    """Convert ``sst`` from Kelvin to Celsius if ``units`` attribute suggests so.
-
-    The check is case-insensitive and recognises: ``K``, ``Kelvin``,
-    ``degK``, ``degrees_K``, *etc.*
-    """
     if "sst" not in ds.data_vars:
         return ds
-    attrs = ds.sst.attrs
-    units = str(attrs.get("units", "")).lower().replace(" ", "").replace(".", "")
-
-    kelvin_indicators = {"k", "kelvin", "degk", "degrees_k"}
-    if units in kelvin_indicators or any(ind in units for ind in ("kelvin", "degk")):
-        logger.info("Converting SST from Kelvin to Celsius (K – 273.15)")
+    units = str(ds.sst.attrs.get("units", "")).lower().replace(" ", "").replace(".", "")
+    if "kelvin" in units or units in ("k", "degk"):
+        logger.info("  Converting SST Kelvin → Celsius")
         ds = ds.assign(sst=ds.sst - 273.15)
         ds.sst.attrs["units"] = "degC"
-    else:
-        logger.info("SST units are '%s' — no conversion needed", attrs.get("units", "unknown"))
     return ds
 
 
 # ===================================================================
-#  Longitude conversion  (0…360 → –180…180)
+#  Longitude conversion  (0–360 → –180…180)
 # ===================================================================
 
-def _is_0_360(ds: xr.Dataset) -> bool:
-    """Return ``True`` if the longitude coordinate spans 0…360."""
-    if "lon" not in ds.coords:
-        return False
+def convert_longitude_1d(ds: xr.Dataset) -> xr.Dataset:
     lon = ds.lon.values
-    return bool(np.any(lon > 180))
+    new_lon = ((lon + 180) % 360) - 180
+    ds = ds.assign_coords(lon=new_lon)
+    ds = ds.sortby("lon")
+    return ds
+
+
+def convert_longitude_2d(ds: xr.Dataset) -> xr.Dataset:
+    lon = ds.lon.values
+    new_lon = ((lon + 180) % 360) - 180
+    ds = ds.assign_coords(lon=xr.DataArray(new_lon, dims=ds.lon.dims))
+    return ds
 
 
 def convert_longitude(ds: xr.Dataset) -> xr.Dataset:
-    """Convert longitude from 0…360 → –180…180 and sort monotonically.
-
-    Works for both 1D ``lon`` coordinates and 2D ``lon`` fields (e.g.
-    ORCA curvilinear grids).
-    """
-    if not _is_0_360(ds):
-        logger.info("Longitude already in –180…180 range — skipping conversion")
-        return ds
-
-    logger.info("Converting longitude from 0…360  →  –180…180")
-
     if "lon" not in ds.coords:
-        logger.warning("'lon' coordinate not found — cannot convert")
         return ds
-
-    lon = ds.lon.values
-
-    if lon.ndim == 1:
-        # 1-D regular grid — simple transformation
-        ds = ds.assign_coords(lon=((lon + 180) % 360) - 180)
-        ds = ds.sortby("lon")
-    elif lon.ndim == 2:
-        # 2-D curvilinear grid — shift each point individually
-        ds = ds.assign_coords(lon=((lon + 180) % 360) - 180)
-        # Sorting 2D lon is not trivial; skip sorting for curvilinear grids.
-        logger.info("2-D longitude field detected — spatial sorting skipped")
-    else:
-        logger.warning("Unexpected lon dimensionality (%d) — skipping", lon.ndim)
-
-    return ds
+    if float(ds.lon.max()) <= 180.0:
+        return ds
+    logger.info("  Converting longitude 0–360 → –180…180")
+    if ds.lon.ndim == 1:
+        return convert_longitude_1d(ds)
+    return convert_longitude_2d(ds)
 
 
 # ===================================================================
-#  Spatial subset  — Indian Ocean
+#  Spatial subset  (Indian Ocean)
 # ===================================================================
 
 def subset_indian_ocean(ds: xr.Dataset) -> xr.Dataset:
-    """Subset the dataset to the Indian Ocean domain.
+    if "lat" not in ds.coords or "lon" not in ds.coords:
+        return ds
 
-    Domain: 20°E – 120°E,  40°S – 30°N.
-
-    Works with both 1-D (label-based) and 2-D (boolean mask) spatial
-    coordinates.
-    """
-    lon_min, lon_max = 20.0, 120.0
-    lat_min, lat_max = -40.0, 30.0
-
-    logger.info(
-        "Subsetting Indian Ocean: lon=[%.0f, %.0f], lat=[%.0f, %.0f]",
-        lon_min, lon_max, lat_min, lat_max,
-    )
-
-    lat_dims, lon_dims = _guess_lat_lon_dims(ds)
-
-    # Determine if we have 1-D or 2-D coordinates
-    lat_1d = "lat" in ds.coords and ds.lat.ndim == 1
-    lon_1d = "lon" in ds.coords and ds.lon.ndim == 1
+    lat_1d = ds.lat.ndim == 1
+    lon_1d = ds.lon.ndim == 1
 
     if lat_1d and lon_1d:
-        # Simple label-based selection (regular grid)
-        ds = ds.sel(lat=slice(lat_min, lat_max), lon=slice(lon_min, lon_max))
-    else:
-        # 2-D curvilinear grid — build a boolean mask
-        if "lat" in ds.coords and "lon" in ds.coords:
-            mask = (
-                (ds.lat >= lat_min) & (ds.lat <= lat_max) &
-                (ds.lon >= lon_min) & (ds.lon <= lon_max)
-            )
-            ds = ds.where(mask, drop=True)
-        else:
-            logger.warning("Cannot subset — lat/lon coordinates not standardised")
-    return ds
+        ds = _ensure_lat_ascending(ds)
+        return ds.sel(**INDIAN_OCEAN)
+
+    mask = (
+        (ds.lat >= INDIAN_OCEAN["lat"].start)
+        & (ds.lat <= INDIAN_OCEAN["lat"].stop)
+        & (ds.lon >= INDIAN_OCEAN["lon"].start)
+        & (ds.lon <= INDIAN_OCEAN["lon"].stop)
+    )
+    if hasattr(mask, "compute"):
+        mask = mask.compute()
+    return ds.where(mask, drop=True)
 
 
 # ===================================================================
-#  Quality control — SST range filtering
+#  Quality control
 # ===================================================================
 
 def remove_impossible_sst(ds: xr.Dataset) -> xr.Dataset:
-    """Mask (set to NaN) SST values outside the physically plausible range.
-
-    Thresholds:  –2 °C  ≤  SST  ≤  40 °C
-
-    The operation is lazy (dask-backed).  The full count of removed
-    values is *not* computed here to avoid loading the whole dataset
-    into memory; only a log message is emitted.
-    """
-    t0 = time.perf_counter()
-    if "sst" not in ds.data_vars:
-        return ds
-
-    ds = ds.where((ds.sst >= -2.0) & (ds.sst <= 40.0), other=np.nan)
-
-    logger.info("SST range filter [–2, 40] °C applied (lazy)")
-    log_done("Remove impossible SST", time.perf_counter() - t0)
+    if "sst" in ds.data_vars:
+        ds["sst"] = ds.sst.where(
+            (ds.sst >= SST_RANGE[0]) & (ds.sst <= SST_RANGE[1]), other=np.nan
+        )
     return ds
+
+
+# ===================================================================
+#  Time standardisation  (unify calendars across CMIP6)
+# ===================================================================
+
+def _try_import_cftime():
+    try:
+        import cftime
+        return cftime
+    except ImportError:
+        return None
+
+
+def _cftime_to_timestamp(t) -> pd.Timestamp:
+    cftime = _try_import_cftime()
+    if cftime is not None and isinstance(t, cftime.datetime):
+        return pd.Timestamp(t.year, t.month, t.day, t.hour, t.minute, t.second)
+    return pd.Timestamp(t)
+
+
+def _time_needs_standardisation(time_values) -> bool:
+    if len(time_values) == 0:
+        return False
+    try:
+        pd.Timestamp(time_values[0])
+        return False
+    except (ValueError, TypeError):
+        return True
+
+
+def standardise_time_calendar(ds: xr.Dataset) -> xr.Dataset:
+    if "time" not in ds.coords:
+        return ds
+    if not _time_needs_standardisation(ds.time.values):
+        return ds
+    logger.info("  Converting non-standard calendar → pandas Timestamp")
+    times = np.array([_cftime_to_timestamp(t) for t in ds.time.values])
+    ds = ds.assign_coords(time=times)
+    return ds
+
+
+def sortby_time_safe(ds: xr.Dataset) -> xr.Dataset:
+    try:
+        return ds.sortby("time")
+    except TypeError:
+        ds = standardise_time_calendar(ds)
+        return ds.sortby("time")
+
+
+# ===================================================================
+#  Grid regridding  (CMIP6 multi-model → common 0.5° grid)
+# ===================================================================
+
+def _make_common_grid(resolution: float) -> tuple[np.ndarray, np.ndarray]:
+    lat = np.arange(
+        INDIAN_OCEAN["lat"].start,
+        INDIAN_OCEAN["lat"].stop + resolution,
+        resolution,
+    )
+    lon = np.arange(
+        INDIAN_OCEAN["lon"].start,
+        INDIAN_OCEAN["lon"].stop + resolution,
+        resolution,
+    )
+    return lat, lon
+
+
+def _regrid_1d(ds: xr.Dataset, target_lat: np.ndarray, target_lon: np.ndarray) -> xr.Dataset:
+    return ds.interp(lat=target_lat, lon=target_lon)
+
+
+def _regrid_2d_to_1d(
+    ds: xr.Dataset, target_lat: np.ndarray, target_lon: np.ndarray
+) -> xr.Dataset:
+    from scipy.interpolate import griddata
+
+    lat2d = ds.lat.values
+    lon2d = ds.lon.values
+    src_pts = np.column_stack([lat2d.ravel(), lon2d.ravel()])
+
+    target_lon2d, target_lat2d = np.meshgrid(target_lon, target_lat)
+    target_pts = np.column_stack([target_lat2d.ravel(), target_lon2d.ravel()])
+
+    sst = ds.sst
+    spatial_dims = [d for d in sst.dims if d != "time"]
+    stacked = sst.stack(grid=spatial_dims)
+
+    n_time = stacked.sizes["time"]
+    n_target = len(target_pts)
+    chunk_size = min(50, n_time)
+
+    results = []
+    for start in range(0, n_time, chunk_size):
+        end = min(start + chunk_size, n_time)
+        chunk = []
+        for t in range(start, end):
+            vals = griddata(src_pts, stacked.isel(time=t).values, target_pts, method="linear")
+            chunk.append(vals)
+        results.extend(chunk)
+        logger.info("    Regridded time steps %d–%d / %d", start + 1, end, n_time)
+
+    interp_data = np.array(results).reshape(n_time, len(target_lat), len(target_lon))
+    return xr.Dataset({
+        "sst": xr.DataArray(
+            interp_data,
+            dims=["time", "lat", "lon"],
+            coords={"time": ds.time.values, "lat": target_lat, "lon": target_lon},
+        )
+    })
+
+
+def regrid_to_common(
+    ds: xr.Dataset, target_lat: np.ndarray, target_lon: np.ndarray
+) -> xr.Dataset:
+    if "lat" not in ds.coords or "lon" not in ds.coords:
+        return ds
+    if ds.lat.ndim == 1 and ds.lon.ndim == 1:
+        return _regrid_1d(ds, target_lat, target_lon)
+    return _regrid_2d_to_1d(ds, target_lat, target_lon)
+
+
+# ===================================================================
+#  Individual file processing
+# ===================================================================
+
+def process_one_file(filepath: Path, standardise: bool = True) -> xr.Dataset:
+    ds = xr.open_dataset(filepath, chunks={})
+    if standardise:
+        ds = standardise_sst_variable(ds)
+        ds = standardise_coordinates(ds)
+    ds = convert_kelvin_to_celsius(ds)
+    ds = convert_longitude(ds)
+    ds = subset_indian_ocean(ds)
+    ds = remove_impossible_sst(ds)
+    return ds
+
+
+# ===================================================================
+#  NOAA pipeline
+# ===================================================================
+
+def load_noaa_dataset() -> xr.Dataset:
+    t0 = time.perf_counter()
+    files = find_netcdf_files(NOAA_DIR)
+    logger.info("Processing %d NOAA years …", len(files))
+
+    parts: list[xr.Dataset] = []
+    for fpath in files:
+        ds = process_one_file(fpath, standardise=False)
+        parts.append(ds)
+
+    logger.info("  Concatenating …")
+    ds = xr.concat(parts, dim="time", coords="minimal", compat="override")
+    ds = sortby_time_safe(ds)
+    ds = ds.chunk({"time": 100, "lat": -1, "lon": -1})
+    _log_done("Load NOAA dataset", time.perf_counter() - t0)
+    _print_info(ds, "NOAA OISST")
+    return ds
+
+
+# ===================================================================
+#  CMIP6 pipeline
+# ===================================================================
+
+def load_cmip6_dataset(data_dir: Path, label: str) -> xr.Dataset:
+    t0 = time.perf_counter()
+    files = find_netcdf_files(data_dir)
+    logger.info("Processing %d CMIP6 files for %s …", len(files), label)
+
+    target_lat, target_lon = _make_common_grid(CMIP6_TARGET_RESOLUTION)
+
+    datasets: list[xr.Dataset] = []
+    for fpath in files:
+        fname = fpath.name[:40]
+        t1 = time.perf_counter()
+        ds = process_one_file(fpath, standardise=True)
+        logger.info("  %s — subset done (%.1f s)", fname, time.perf_counter() - t1)
+
+        t2 = time.perf_counter()
+        ds = regrid_to_common(ds, target_lat, target_lon)
+        ds = standardise_time_calendar(ds)
+        logger.info("  %s — regrid done (%.1f s)", fname, time.perf_counter() - t2)
+        datasets.append(ds)
+
+    logger.info("  Concatenating …")
+    ds = xr.concat(datasets, dim="time", coords="minimal", compat="override")
+    ds = sortby_time_safe(ds)
+    extras = [v for v in ds.data_vars if v not in ("sst", "lat", "lon")]
+    if extras:
+        ds = ds.drop_vars(extras, errors="ignore")
+    ds = ds.chunk({"time": 100, "lat": -1, "lon": -1})
+    _log_done(f"Load CMIP6 dataset ({label})", time.perf_counter() - t0)
+    _print_info(ds, label)
+    return ds
+
+
+def _print_info(ds: xr.Dataset, label: str) -> None:
+    logger.info("--- %s metadata ---", label)
+    logger.info("  Dimensions   : %s", dict(ds.sizes))
+    logger.info("  Coordinates  : %s", list(ds.coords))
+    logger.info("  Data vars    : %s", list(ds.data_vars))
+    if "time" in ds.dims and ds.sizes["time"] > 0:
+        try:
+            tv = ds.time.values
+            logger.info("  Time range   : %s  ->  %s", str(tv[0])[:19], str(tv[-1])[:19])
+            logger.info("  Time steps   : %d", ds.sizes["time"])
+        except Exception:
+            logger.info("  Time steps   : %d", ds.sizes["time"])
 
 
 # ===================================================================
@@ -413,183 +446,138 @@ def remove_impossible_sst(ds: xr.Dataset) -> xr.Dataset:
 # ===================================================================
 
 def validate_time_axis(ds: xr.Dataset) -> xr.Dataset:
-    """Validate and standardise the time coordinate.
-
-    Operations
-    ----------
-    1. Convert to ``datetime64`` if needed.
-    2. Sort chronologically.
-    3. Drop duplicate time steps.
-    4. Report missing dates (daily data only).
-    """
     t0 = time.perf_counter()
     if "time" not in ds.dims:
-        logger.warning("No time dimension found — skipping time validation")
+        logger.warning("No time dimension — skipping time validation")
         return ds
 
-    # Convert to datetime
-    ds["time"] = xr.decode_cf(ds).time
+    ds = sortby_time_safe(ds)
 
-    # Sort
-    ds = ds.sortby("time")
-
-    # Drop duplicates
-    _, index = np.unique(ds.time.values, return_index=True)
+    tv = ds.time.values
+    _, index = np.unique(tv, return_index=True)
     if len(index) < ds.sizes["time"]:
         n_dup = ds.sizes["time"] - len(index)
-        logger.warning("Found %d duplicate time steps — removing", n_dup)
+        logger.warning("Removed %d duplicate time steps", n_dup)
         ds = ds.isel(time=np.sort(index))
+        tv = ds.time.values
 
-    # Report
-    time_vals = ds.time.values
-    logger.info("Start date        : %s", str(time_vals[0])[:19])
-    logger.info("End date          : %s", str(time_vals[-1])[:19])
-    logger.info("Number of steps   : %d", len(time_vals))
+    logger.info("  Start date        : %s", str(tv[0])[:19])
+    logger.info("  End date          : %s", str(tv[-1])[:19])
+    logger.info("  Number of steps   : %d", len(tv))
 
-    # Check for missing dates (daily frequency)
-    if len(time_vals) > 1:
-        deltas = np.diff(time_vals).astype("timedelta64[D]").astype(int)
-        expected_daily = np.timedelta64(1, "D").astype("timedelta64[D]").astype(int)
-        missing = np.sum(deltas[deltas > expected_daily])
-        if missing > 0:
-            logger.warning("Approximate number of missing days: %d", int(missing))
-
-    log_done("Validate time axis", time.perf_counter() - t0)
+    if len(tv) > 1:
+        try:
+            deltas = np.diff(tv.astype("datetime64[D]")).astype(int)
+            missing = int(deltas[deltas > 1].sum())
+            if missing:
+                logger.warning("  Approx. missing days : %d", missing)
+        except Exception:
+            logger.warning("  Could not compute missing days (mixed calendars)")
+    _log_done("Validate time axis", time.perf_counter() - t0)
     return ds
 
 
 # ===================================================================
-#  Dataset summary report
+#  Dataset summary
 # ===================================================================
 
 def dataset_summary(ds: xr.Dataset, label: str) -> dict:
-    """Print a detailed statistical summary of *ds* and return as a dict.
-
-    All statistics are computed via dask reductions (chunk-by-chunk) so
-    that the full dataset is never loaded into memory.
-
-    Parameters
-    ----------
-    ds : xr.Dataset
-        Dataset containing ``sst`` variable.
-    label : str
-        Human-readable name for the dataset (printed in the report).
-
-    Returns
-    -------
-    dict
-        Summary statistics.
-    """
     logger.info("")
-    logger.info("─" * 50)
-    logger.info("  DATASET SUMMARY  —  %s", label)
-    logger.info("─" * 50)
+    logger.info("-" * 50)
+    logger.info("  DATASET SUMMARY  ---  %s", label)
+    logger.info("-" * 50)
 
     sst = ds.sst
-    summary: dict = {
-        "label": label,
-        "shape": dict(ds.sizes),
-        "resolution_lat": None,
-        "resolution_lon": None,
-        "min_sst": None,
-        "max_sst": None,
-        "mean_sst": None,
-        "std_sst": None,
-        "missing_pct": None,
-    }
-
-    if "lat" in ds.coords and ds.lat.ndim == 1 and len(ds.lat) > 1:
-        summary["resolution_lat"] = float(
-            abs(np.diff(ds.lat.values[:2])[0])
-        )
-        if "lon" in ds.coords and ds.lon.ndim == 1 and len(ds.lon) > 1:
-            summary["resolution_lon"] = float(
-                abs(np.diff(ds.lon.values[:2])[0])
-            )
-
+    shape = dict(ds.sizes)
     total = int(sst.size)
+    approx_gb = total * 4.0 / (1024 ** 3)
 
-    min_val, max_val, mean_val, std_val, n_missing = dask_compute(
-        sst.min(), sst.max(), sst.mean(), sst.std(), sst.isnull().sum(),
+    res_lat = None
+    res_lon = None
+    if "lat" in ds.coords and ds.lat.ndim == 1 and len(ds.lat) > 1:
+        res_lat = float(abs(np.diff(ds.lat.values[:2])[0]))
+    if "lon" in ds.coords and ds.lon.ndim == 1 and len(ds.lon) > 1:
+        res_lon = float(abs(np.diff(ds.lon.values[:2])[0]))
+
+    logger.info("  Shape       : %s", shape)
+    logger.info("  Approx      : %.1f GB (float32)", approx_gb)
+    logger.info("  (computing global statistics …)")
+
+    min_sst, max_sst, mean_sst, std_sst, missing = map(
+        float,
+        dask.compute(
+            sst.min(), sst.max(), sst.mean(), sst.std(), sst.isnull().sum()
+        ),
     )
-    missing = int(n_missing)
-    summary["missing_pct"] = (missing / total * 100.0) if total else 0.0
+    missing = int(missing)
+    missing_pct = missing / total * 100.0 if total else 0.0
 
-    if total - missing > 0:
-        summary["min_sst"] = float(min_val)
-        summary["max_sst"] = float(max_val)
-        summary["mean_sst"] = float(mean_val)
-        summary["std_sst"] = float(std_val)
+    logger.info("  Resolution  : lat=%.3f%s, lon=%.3f%s",
+                 res_lat or 0, chr(176), res_lon or 0, chr(176))
+    logger.info("  Min SST     : %.3f %sC", min_sst, chr(176))
+    logger.info("  Max SST     : %.3f %sC", max_sst, chr(176))
+    logger.info("  Mean SST    : %.3f %sC", mean_sst, chr(176))
+    logger.info("  Std SST     : %.3f %sC", std_sst, chr(176))
+    logger.info("  Missing     : %.2f %%", missing_pct)
+    logger.info("-" * 50)
 
-    logger.info("  Shape            : %s", summary["shape"])
-    logger.info(
-        "  Resolution       : lat=%.3f\xb0, lon=%.3f\xb0",
-        summary["resolution_lat"] or 0,
-        summary["resolution_lon"] or 0,
-    )
-    logger.info("  Min SST          : %.3f \xb0C", summary["min_sst"] or 0)
-    logger.info("  Max SST          : %.3f \xb0C", summary["max_sst"] or 0)
-    logger.info("  Mean SST         : %.3f \xb0C", summary["mean_sst"] or 0)
-    logger.info("  Std SST          : %.3f \xb0C", summary["std_sst"] or 0)
-    logger.info("  Missing values   : %.2f %%", summary["missing_pct"])
-    logger.info("─" * 50)
-    return summary
+    return {
+        "label": label,
+        "shape": shape,
+        "resolution_lat": res_lat,
+        "resolution_lon": res_lon,
+        "min_sst": min_sst,
+        "max_sst": max_sst,
+        "mean_sst": mean_sst,
+        "std_sst": std_sst,
+        "missing_pct": missing_pct,
+    }
 
 
 # ===================================================================
-#  Save processed output
+#  Save
 # ===================================================================
 
 def save_dataset(ds: xr.Dataset, filename: str) -> Path:
-    """Write a dataset to ``data/processed/`` as NetCDF.
-
-    Compression is applied (zlib, complevel=5) to save disk space.
-
-    Parameters
-    ----------
-    ds : xr.Dataset
-    filename : str
-        Output filename (e.g. ``noaa_processed.nc``).
-
-    Returns
-    -------
-    Path
-        Full path to the saved file.
-    """
-    t0 = time.perf_counter()
     PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
     path = PROCESSED_DIR / filename
 
-    encoding = {}
-    for var in ds.data_vars:
-        encoding[var] = {"zlib": True, "complevel": 5}
+    encoding = {v: {"zlib": True, "complevel": 1} for v in ds.data_vars}
+    if "time" in ds.dims:
+        ds = ds.chunk({"time": 100})
 
-    ds.to_netcdf(path, encoding=encoding)
-    file_mb = path.stat().st_size / (1024 * 1024)
-    logger.info("Saved  %s  →  %.1f MB", path, file_mb)
-    log_done("Save dataset", time.perf_counter() - t0)
+    fd, tmp_path = tempfile.mkstemp(suffix=".nc", dir=str(PROCESSED_DIR))
+    os.close(fd)
+    try:
+        ds.to_netcdf(tmp_path, encoding=encoding)
+        os.replace(tmp_path, str(path))
+    except BaseException:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+        raise
+
+    size_mb = path.stat().st_size / (1024 * 1024)
+    logger.info("Saved  %s  (%.0f MB)", path, size_mb)
     return path
 
 
 # ===================================================================
-#  Quick-look figures
+#  Figures
 # ===================================================================
 
-def generate_figures(ds: xr.Dataset, label: str) -> None:
-    """Create four quick-look figures for the harmonised dataset.
-
-    1. Mean SST map
-    2. SST histogram (random sample of 1 × 10⁶ points)
-    3. Basin-averaged SST time series
-    4. Monthly climatology
-
-    All figures are saved to ``outputs/preprocessing/``.
-    Uses dask-friendly reductions — never loads the full cube.
-    """
-    t0 = time.perf_counter()
+def _maybe_import_plt():
     try:
+        import matplotlib
+        matplotlib.use("Agg")
         import matplotlib.pyplot as plt
+        return plt
     except ImportError:
+        return None
+
+
+def generate_figures(ds: xr.Dataset, label: str) -> None:
+    plt = _maybe_import_plt()
+    if plt is None:
         logger.warning("matplotlib not available — skipping figures")
         return
 
@@ -597,70 +585,68 @@ def generate_figures(ds: xr.Dataset, label: str) -> None:
     sst = ds.sst
     prefix = FIGURES_DIR / label
 
-    # ----- (1) Mean SST map -----
-    logger.info("  Computing mean SST map …")
-    sst_mean = sst.mean("time").compute()
+    spatial_dims = [d for d in sst.dims if d != "time"]
+
+    logger.info("  Computing figure data …")
+    sst_mean, ts, sample = dask.compute(
+        sst.mean("time"),
+        sst.mean(dim=spatial_dims),
+        sst.isel(time=slice(None, None, 100)),
+    )
+
+    # (1) Mean SST map
+    logger.info("  Plotting mean SST map …")
     fig, ax = plt.subplots(figsize=(8, 4))
-    lon2d = ds.lon.values if ds.lon.ndim == 2 else ds.lon.values
-    lat2d = ds.lat.values if ds.lat.ndim == 2 else ds.lat.values
-    p = ax.pcolormesh(lon2d, lat2d, sst_mean.values, cmap="RdBu_r", shading="auto")
-    plt.colorbar(p, ax=ax, label="SST (\xb0C)")
+    ax.pcolormesh(ds.lon, ds.lat, sst_mean, cmap="RdBu_r", shading="auto")
+    plt.colorbar(ax.collections[0], ax=ax, label=f"SST ({chr(176)}C)")
     ax.set_title(f"{label} — Mean SST")
     ax.set_xlabel("Longitude")
     ax.set_ylabel("Latitude")
-    fig.savefig(prefix + "_mean_sst.png", dpi=150, bbox_inches="tight")
+    fig.savefig(f"{prefix}_mean_sst.png", dpi=150, bbox_inches="tight")
     plt.close(fig)
-    logger.info("Figure saved: %s_mean_sst.png", prefix)
 
-    # ----- (2) SST histogram (subsample) -----
-    logger.info("  Computing SST histogram (subsample) …")
-    sample = sst.chunk({"time": -1}).isel(
-        time=slice(None, None, max(1, sst.sizes["time"] // 100))
-    ).load()
-    sst_vals = sample.values.ravel()
-    sst_vals = sst_vals[~np.isnan(sst_vals)]
-    if len(sst_vals) > 1_000_000:
-        rng = np.random.default_rng(42)
-        sst_vals = rng.choice(sst_vals, 1_000_000, replace=False)
+    # (2) Histogram
+    logger.info("  Plotting SST histogram …")
+    vals = sample.values.ravel()
+    vals = vals[~np.isnan(vals)]
+    if len(vals) > 1_000_000:
+        vals = np.random.default_rng(42).choice(vals, 1_000_000, replace=False)
 
     fig, ax = plt.subplots(figsize=(7, 4))
-    ax.hist(sst_vals, bins=100, color="steelblue", edgecolor="none", alpha=0.8)
-    ax.set_xlabel("SST (\xb0C)")
+    ax.hist(vals, bins=100, color="steelblue", edgecolor="none", alpha=0.8)
+    ax.set_xlabel(f"SST ({chr(176)}C)")
     ax.set_ylabel("Frequency")
-    ax.set_title(f"{label} — SST Distribution (sample)")
-    fig.savefig(prefix + "_histogram.png", dpi=150, bbox_inches="tight")
+    ax.set_title(f"{label} — SST Distribution")
+    fig.savefig(f"{prefix}_histogram.png", dpi=150, bbox_inches="tight")
     plt.close(fig)
-    logger.info("Figure saved: %s_histogram.png", prefix)
 
-    # ----- (3) Basin-averaged SST time series -----
-    logger.info("  Computing basin-averaged time series …")
-    sst_ts = sst.mean(dim=[d for d in sst.dims if d != "time"]).compute()
+    # (3) Basin-averaged time series
+    logger.info("  Plotting basin-averaged time series …")
     fig, ax = plt.subplots(figsize=(10, 3))
-    ax.plot(sst_ts.time.values, sst_ts.values, linewidth=0.5, color="k")
+    ax.plot(ts.time, ts, linewidth=0.5, color="k")
     ax.set_xlabel("Time")
-    ax.set_ylabel("SST (\xb0C)")
+    ax.set_ylabel(f"SST ({chr(176)}C)")
     ax.set_title(f"{label} — Basin-averaged SST")
     fig.autofmt_xdate()
-    fig.savefig(prefix + "_timeseries.png", dpi=150, bbox_inches="tight")
+    fig.savefig(f"{prefix}_timeseries.png", dpi=150, bbox_inches="tight")
     plt.close(fig)
-    logger.info("Figure saved: %s_timeseries.png", prefix)
 
-    # ----- (4) Monthly climatology -----
+    # (4) Monthly climatology
     logger.info("  Computing monthly climatology …")
     clim = sst.groupby("time.month").mean("time")
-    clim_ts = clim.mean(dim=[d for d in sst.dims if d != "month"]).compute()
+    clim_spatial_dims = [d for d in clim.dims if d != "month"]
+    clim_mean = clim.mean(dim=clim_spatial_dims).compute()
+
     fig, ax = plt.subplots(figsize=(7, 4))
-    ax.plot(clim_ts.month.values, clim_ts.values, marker="o", linestyle="-",
-            color="crimson")
+    ax.plot(clim_mean.month, clim_mean, marker="o", linestyle="-", color="crimson")
     ax.set_xlabel("Month")
-    ax.set_ylabel("SST (\xb0C)")
+    ax.set_ylabel(f"SST ({chr(176)}C)")
     ax.set_title(f"{label} — Monthly Climatology")
     ax.set_xticks(range(1, 13))
-    fig.savefig(prefix + "_climatology.png", dpi=150, bbox_inches="tight")
+    fig.savefig(f"{prefix}_climatology.png", dpi=150, bbox_inches="tight")
     plt.close(fig)
-    logger.info("Figure saved: %s_climatology.png", prefix)
 
-    log_done("Generate figures", time.perf_counter() - t0)
+    logger.info("  Figures saved to %s", FIGURES_DIR)
 
 
 # ===================================================================
@@ -668,119 +654,76 @@ def generate_figures(ds: xr.Dataset, label: str) -> None:
 # ===================================================================
 
 def run_preprocessing_pipeline(source: str) -> xr.Dataset:
-    """Run the full preprocessing pipeline for one data source.
-
-    Parameters
-    ----------
-    source : str
-        ``"noaa"`` or ``"cmip6"``.
-
-    Returns
-    -------
-    xr.Dataset
-        Fully preprocessed dataset ready for downstream analysis.
-    """
     logger.info("")
-    logger.info("╔══════════════════════════════════════════════════════╗")
-    logger.info("║  Preprocessing pipeline  —  %-17s  ║", source.upper())
-    logger.info("╚══════════════════════════════════════════════════════╝")
+    logger.info("=" * 58)
+    logger.info("  Preprocessing pipeline  ---  %s", source.upper())
+    logger.info("=" * 58)
 
-    # ---- STEP 1 & 2 : Load ----
+    data_dir = SOURCE_DIR_MAP.get(source)
+    if data_dir is None:
+        raise ValueError(f"Unknown source '{source}'. Use: {list(SOURCE_DIR_MAP)}")
+
     if source == "noaa":
-        step_name = "Load NOAA dataset"
-        log_step(step_name)
         ds = load_noaa_dataset()
-        log_done(step_name, 0.0)
     else:
-        step_name = "Load CMIP6 dataset"
-        log_step(step_name)
-        ds = load_cmip6_dataset()
-        log_done(step_name, 0.0)
+        ds = load_cmip6_dataset(data_dir, source.upper())
 
-    # ---- STEP 2b : Standardise variable name ----
-    step_name = "Standardise variable names"
-    log_step(step_name)
-    ds = _standardise_variable(ds)
-    log_done(step_name, 0.0)
-
-    # ---- STEP 3 : Convert Kelvin → Celsius ----
-    step_name = "Convert Kelvin → Celsius"
-    log_step(step_name)
-    ds = convert_kelvin_to_celsius(ds)
-    log_done(step_name, 0.0)
-
-    # ---- STEP 4 : Rename coordinates ----
-    step_name = "Rename coordinates"
-    log_step(step_name)
-    ds = standardise_coordinates(ds)
-    log_done(step_name, 0.0)
-
-    # ---- STEP 5 : Convert longitude ----
-    step_name = "Convert longitude 0–360 → –180…180"
-    log_step(step_name)
-    ds = convert_longitude(ds)
-    log_done(step_name, 0.0)
-
-    # ---- STEP 6 : Subset Indian Ocean ----
-    step_name = "Subset Indian Ocean domain"
-    log_step(step_name)
-    ds = subset_indian_ocean(ds)
-    log_done(step_name, 0.0)
-
-    # ---- STEP 7 : Remove impossible SST ----
-    step_name = "Remove impossible SST values"
-    log_step(step_name)
-    ds = remove_impossible_sst(ds)
-    log_done(step_name, 0.0)
-
-    # ---- STEP 8 : Validate time axis ----
-    step_name = "Validate time axis"
-    log_step(step_name)
+    _log_step("Validate time axis")
+    t1 = time.perf_counter()
     ds = validate_time_axis(ds)
-    log_done(step_name, 0.0)
+    _log_done("Validate time axis", time.perf_counter() - t1)
 
-    # ---- STEP 9 : Dataset summary ----
-    step_name = "Dataset summary"
-    log_step(step_name)
     dataset_summary(ds, source.upper())
-    log_done(step_name, 0.0)
-
     return ds
 
 
-def main() -> None:
-    """Run the full preprocessing pipeline for both NOAA and CMIP6."""
+def main(sources: tuple[str, ...] | None = None) -> None:
     overall_start = time.perf_counter()
     setup_logging()
+
+    if not sources:
+        src_list = ("noaa", "cmip6_historical")
+    else:
+        src_list = sources
+
+    valid_sources = [s for s in src_list if s in SOURCE_DIR_MAP]
+    skipped = [s for s in src_list if s not in SOURCE_DIR_MAP]
+    for s in skipped:
+        logger.warning("Unknown source '%s' — skipping. Known: %s", s, list(SOURCE_DIR_MAP))
+
+    if not valid_sources:
+        logger.error("No valid sources to process")
+        sys.exit(1)
+
     logger.info("")
-    logger.info("████████████████████████████████████████████████████")
-    logger.info("██  Preprocessing Pipeline  —  NOAA + CMIP6     ██")
-    logger.info("████████████████████████████████████████████████████")
+    logger.info("  Preprocessing Pipeline  ---  %s", " + ".join(s.upper() for s in valid_sources))
 
-    # ---- Process NOAA ----
-    t_noaa = time.perf_counter()
-    ds_noaa = run_preprocessing_pipeline("noaa")
-    # ---- STEP 10 : Save ----
-    logger.info("Saving NOAA processed dataset …")
-    save_dataset(ds_noaa, "noaa_processed.nc")
-    # ---- STEP 11 : Figures ----
-    logger.info("Generating NOAA figures …")
-    generate_figures(ds_noaa, "noaa")
-    logger.info("NOAA pipeline finished in %.2f s", time.perf_counter() - t_noaa)
+    for src in valid_sources:
+        data_dir = SOURCE_DIR_MAP[src]
+        if data_dir is None or not data_dir.exists():
+            logger.warning("Directory for '%s' does not exist (%s) — skipping", src, data_dir)
+            continue
 
-    # ---- Process CMIP6 ----
-    t_cmip = time.perf_counter()
-    ds_cmip6 = run_preprocessing_pipeline("cmip6")
-    save_dataset(ds_cmip6, "cmip6_processed.nc")
-    generate_figures(ds_cmip6, "cmip6")
-    logger.info("CMIP6 pipeline finished in %.2f s", time.perf_counter() - t_cmip)
+        processed_path = PROCESSED_DIR / f"{src}_processed.nc"
+        if processed_path.exists():
+            logger.info("'%s' already exists — skipping %s", processed_path.name, src)
+            continue
 
-    total = time.perf_counter() - overall_start
+        t_src = time.perf_counter()
+        try:
+            ds = run_preprocessing_pipeline(src)
+            save_dataset(ds, f"{src}_processed.nc")
+            generate_figures(ds, src)
+            elapsed = time.perf_counter() - t_src
+            logger.info("%s pipeline finished in %.1f s", src, elapsed)
+        except Exception as e:
+            logger.error("%s pipeline FAILED: %s", src, e)
+            traceback.print_exc()
+
     logger.info("")
-    logger.info("████████████████████████████████████████████████████")
-    logger.info("██  All done  —  total time: %6.2f s          ██", total)
-    logger.info("████████████████████████████████████████████████████")
+    logger.info("  All done  ---  total time: %.1f s", time.perf_counter() - overall_start)
 
 
 if __name__ == "__main__":
-    main()
+    args = tuple(sys.argv[1:]) if len(sys.argv) > 1 else ()
+    main(args if args else None)
