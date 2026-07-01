@@ -1,27 +1,22 @@
 """
 preprocess.py
 =============
-Production-ready preprocessing pipeline for NOAA OISSTv2 and CMIP6 SST.
+Preprocess NOAA OISST and individual CMIP6 model SST data.
 
-Loads NetCDF files, standardises names/coordinates/units, subsets the
-Indian Ocean (20°E–120°E, 40°S–30°N), filters impossible SST values,
-regrids CMIP6 models to a common 0.5° grid, computes summary statistics,
-saves compressed NetCDF to ``data/processed/``, and generates quick-look
-figures in ``outputs/preprocessing/``.
+Each CMIP6 model is processed independently (never merged).  Output is one
+NetCDF file per model in ``data/processed/``, plus per-model quick-look
+figures in ``outputs/preprocessing/<model_name>/``.
 
 Usage
 -----
-    python scripts/preprocess.py              # NOAA + CMIP6 historical
-    python scripts/preprocess.py noaa         # NOAA only
-    python scripts/preprocess.py cmip6        # CMIP6 historical only
-    python scripts/preprocess.py cmip6_future # CMIP6 future only
-    python scripts/preprocess.py noaa cmip6 cmip6_future  # all
+    python scripts/preprocess.py          # NOAA + all CMIP6 models
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import re
 import sys
 import tempfile
 import time
@@ -29,7 +24,6 @@ import traceback
 from pathlib import Path
 
 import dask
-import dask.array as da
 import numpy as np
 import pandas as pd
 import xarray as xr
@@ -45,30 +39,27 @@ CMIP6_FUTURE_DIR = DATA_DIR / "cmip6_future"
 PROCESSED_DIR = DATA_DIR / "processed"
 FIGURES_DIR = PROJECT_ROOT / "outputs" / "preprocessing"
 
-SOURCE_DIR_MAP: dict[str, Path] = {
-    "noaa": NOAA_DIR,
-    "cmip6": CMIP6_DIR,
-    "cmip6_historical": CMIP6_DIR,
-    "cmip6_future": CMIP6_FUTURE_DIR,
-}
-
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 SST_VARIABLE_NAMES = {"sst", "tos", "thetao"}
 COORD_RENAME_MAP: dict[str, str] = {
     "latitude": "lat",
-    "lat": "lat",
     "nav_lat": "lat",
     "longitude": "lon",
-    "lon": "lon",
     "nav_lon": "lon",
 }
 INDIAN_OCEAN = dict(lat=slice(-40.0, 30.0), lon=slice(20.0, 120.0))
 SST_RANGE = (-2.0, 40.0)
-CMIP6_TARGET_RESOLUTION = 0.5  # degrees
+CMIP6_TARGET_RESOLUTION = 0.5
 
 logger = logging.getLogger("preprocess")
+
+# CMIP6 filename pattern:  <variable>_<mip>_<model_id>_<experiment>_...
+# Model name is the 3rd underscore-delimited field.
+CMIP6_FILENAME_RE = re.compile(
+    r"^[^_]+_[^_]+_(?P<model>[^_]+(?:-[^_]+)*)_"
+)
 
 
 # ===================================================================
@@ -83,19 +74,8 @@ def setup_logging() -> None:
     )
 
 
-def _log_step(name: str) -> None:
-    logger.info("")
-    logger.info("=" * 60)
-    logger.info("START  %s", name)
-    logger.info("=" * 60)
-
-
 def _log_done(name: str, sec: float) -> None:
     logger.info("%s  …  done  (%.2f s)", name, sec)
-
-
-def _fmt_gb(n_bytes: float) -> str:
-    return f"{n_bytes / (1024 ** 3):.2f} GB"
 
 
 # ===================================================================
@@ -108,6 +88,59 @@ def find_netcdf_files(directory: Path) -> list[Path]:
         raise FileNotFoundError(f"No NetCDF files found in {directory}")
     logger.info("Found %d NetCDF file(s) in %s", len(files), directory)
     return files
+
+
+def extract_model_name(filename: str) -> str:
+    """Extract CMIP6 model ID from a standard CMIP6 filename.
+
+    Example
+    -------
+    >>> extract_model_name("tos_Omon_EC-Earth3-CC_historical_r1i1p1f1_gn_19820116-20141216.nc")
+    'EC-Earth3-CC'
+    """
+    m = CMIP6_FILENAME_RE.match(filename)
+    if m is None:
+        raise ValueError(f"Cannot parse model name from filename: {filename}")
+    return m.group("model")
+
+
+def discover_cmip6_models(directory: Path) -> list[tuple[str, Path]]:
+    """Return list of (model_name, filepath) for each CMIP6 file found."""
+    files = find_netcdf_files(directory)
+    models: list[tuple[str, Path]] = []
+    for fpath in files:
+        name = extract_model_name(fpath.name)
+        models.append((name, fpath))
+    return models
+
+
+# ===================================================================
+#  Cleanup — remove old merged-pipeline outputs
+# ===================================================================
+
+def _clean_old_merged_outputs() -> None:
+    """Delete artefacts from the old merged-CMIP6 pipeline.
+
+    Only removes files that are known to come from the merged approach;
+    NOAA outputs and per-model files are left untouched.
+    """
+    old_patterns = [
+        PROCESSED_DIR / "cmip6_historical_processed.nc",
+        PROCESSED_DIR / "cmip6_historical_regridded.nc",
+        PROCESSED_DIR / "cmip6_future_processed.nc",
+        PROCESSED_DIR / "cmip6_future_regridded.nc",
+    ]
+    for p in old_patterns:
+        if p.exists():
+            p.unlink()
+            logger.info("Removed old merged file: %s", p.name)
+
+    old_fig_fig_dires = ["cmip6_historical_", "cmip6_future_"]
+    if FIGURES_DIR.exists():
+        for f in FIGURES_DIR.iterdir():
+            if f.is_file() and any(f.name.startswith(pre) for pre in old_fig_fig_dires):
+                f.unlink()
+                logger.info("Removed old merged figure: %s", f.name)
 
 
 # ===================================================================
@@ -133,7 +166,9 @@ def standardise_coordinates(ds: xr.Dataset) -> xr.Dataset:
     if rename:
         ds = ds.rename(rename)
 
-    non_essential = [v for v in ds.coords if v not in ("lat", "lon", "time") and v not in ds.dims]
+    non_essential = [
+        v for v in ds.coords if v not in ("lat", "lon", "time") and v not in ds.dims
+    ]
     if non_essential:
         ds = ds.drop_vars(non_essential, errors="ignore")
 
@@ -233,7 +268,7 @@ def remove_impossible_sst(ds: xr.Dataset) -> xr.Dataset:
 
 
 # ===================================================================
-#  Time standardisation  (unify calendars across CMIP6)
+#  Time standardisation
 # ===================================================================
 
 def _try_import_cftime():
@@ -281,7 +316,7 @@ def sortby_time_safe(ds: xr.Dataset) -> xr.Dataset:
 
 
 # ===================================================================
-#  Grid regridding  (CMIP6 multi-model → common 0.5° grid)
+#  Grid regridding  (CMIP6 → common 0.5° grid)
 # ===================================================================
 
 def _make_common_grid(resolution: float) -> tuple[np.ndarray, np.ndarray]:
@@ -353,7 +388,7 @@ def regrid_to_common(
 
 
 # ===================================================================
-#  Individual file processing
+#  Per-file processing
 # ===================================================================
 
 def process_one_file(filepath: Path, standardise: bool = True) -> xr.Dataset:
@@ -372,7 +407,7 @@ def process_one_file(filepath: Path, standardise: bool = True) -> xr.Dataset:
 #  NOAA pipeline
 # ===================================================================
 
-def load_noaa_dataset() -> xr.Dataset:
+def process_noaa() -> xr.Dataset:
     t0 = time.perf_counter()
     files = find_netcdf_files(NOAA_DIR)
     logger.info("Processing %d NOAA years …", len(files))
@@ -392,40 +427,41 @@ def load_noaa_dataset() -> xr.Dataset:
 
 
 # ===================================================================
-#  CMIP6 pipeline
+#  CMIP6 single-model pipeline
 # ===================================================================
 
-def load_cmip6_dataset(data_dir: Path, label: str) -> xr.Dataset:
+def process_one_cmip6_model(model_name: str, filepath: Path) -> xr.Dataset:
+    """Process one CMIP6 model file end‑to‑end (no merging)."""
     t0 = time.perf_counter()
-    files = find_netcdf_files(data_dir)
-    logger.info("Processing %d CMIP6 files for %s …", len(files), label)
+    logger.info("")
+    logger.info("--------------------------------------------------")
+    logger.info("  Processing %s", model_name)
+    logger.info("--------------------------------------------------")
 
     target_lat, target_lon = _make_common_grid(CMIP6_TARGET_RESOLUTION)
 
-    datasets: list[xr.Dataset] = []
-    for fpath in files:
-        fname = fpath.name[:40]
-        t1 = time.perf_counter()
-        ds = process_one_file(fpath, standardise=True)
-        logger.info("  %s — subset done (%.1f s)", fname, time.perf_counter() - t1)
+    fname = filepath.name[:40]
+    t1 = time.perf_counter()
+    ds = process_one_file(filepath, standardise=True)
+    logger.info("  %s — subset done (%.1f s)", fname, time.perf_counter() - t1)
 
-        t2 = time.perf_counter()
-        ds = regrid_to_common(ds, target_lat, target_lon)
-        ds = standardise_time_calendar(ds)
-        logger.info("  %s — regrid done (%.1f s)", fname, time.perf_counter() - t2)
-        datasets.append(ds)
+    t2 = time.perf_counter()
+    ds = regrid_to_common(ds, target_lat, target_lon)
+    ds = standardise_time_calendar(ds)
+    logger.info("  %s — regrid done (%.1f s)", fname, time.perf_counter() - t2)
 
-    logger.info("  Concatenating …")
-    ds = xr.concat(datasets, dim="time", coords="minimal", compat="override")
-    ds = sortby_time_safe(ds)
     extras = [v for v in ds.data_vars if v not in ("sst", "lat", "lon")]
     if extras:
         ds = ds.drop_vars(extras, errors="ignore")
     ds = ds.chunk({"time": 100, "lat": -1, "lon": -1})
-    _log_done(f"Load CMIP6 dataset ({label})", time.perf_counter() - t0)
-    _print_info(ds, label)
+
+    _log_done(f"Process CMIP6 model  {model_name}", time.perf_counter() - t0)
     return ds
 
+
+# ===================================================================
+#  Print info
+# ===================================================================
 
 def _print_info(ds: xr.Dataset, label: str) -> None:
     logger.info("--- %s metadata ---", label)
@@ -446,6 +482,7 @@ def _print_info(ds: xr.Dataset, label: str) -> None:
 # ===================================================================
 
 def validate_time_axis(ds: xr.Dataset) -> xr.Dataset:
+    """Remove duplicate timestamps; report gaps."""
     t0 = time.perf_counter()
     if "time" not in ds.dims:
         logger.warning("No time dimension — skipping time validation")
@@ -562,7 +599,7 @@ def save_dataset(ds: xr.Dataset, filename: str) -> Path:
 
 
 # ===================================================================
-#  Figures
+#  Figures  (per model, placed in a subdirectory)
 # ===================================================================
 
 def _maybe_import_plt():
@@ -575,15 +612,21 @@ def _maybe_import_plt():
         return None
 
 
+def _get_figure_dir(label: str) -> Path:
+    """Return the per‑model figure directory, creating it if needed."""
+    fig_dir = FIGURES_DIR / label
+    fig_dir.mkdir(parents=True, exist_ok=True)
+    return fig_dir
+
+
 def generate_figures(ds: xr.Dataset, label: str) -> None:
     plt = _maybe_import_plt()
     if plt is None:
         logger.warning("matplotlib not available — skipping figures")
         return
 
-    FIGURES_DIR.mkdir(parents=True, exist_ok=True)
+    fig_dir = _get_figure_dir(label)
     sst = ds.sst
-    prefix = FIGURES_DIR / label
 
     spatial_dims = [d for d in sst.dims if d != "time"]
 
@@ -602,7 +645,7 @@ def generate_figures(ds: xr.Dataset, label: str) -> None:
     ax.set_title(f"{label} — Mean SST")
     ax.set_xlabel("Longitude")
     ax.set_ylabel("Latitude")
-    fig.savefig(f"{prefix}_mean_sst.png", dpi=150, bbox_inches="tight")
+    fig.savefig(fig_dir / "mean_sst.png", dpi=150, bbox_inches="tight")
     plt.close(fig)
 
     # (2) Histogram
@@ -617,7 +660,7 @@ def generate_figures(ds: xr.Dataset, label: str) -> None:
     ax.set_xlabel(f"SST ({chr(176)}C)")
     ax.set_ylabel("Frequency")
     ax.set_title(f"{label} — SST Distribution")
-    fig.savefig(f"{prefix}_histogram.png", dpi=150, bbox_inches="tight")
+    fig.savefig(fig_dir / "histogram.png", dpi=150, bbox_inches="tight")
     plt.close(fig)
 
     # (3) Basin-averaged time series
@@ -628,7 +671,7 @@ def generate_figures(ds: xr.Dataset, label: str) -> None:
     ax.set_ylabel(f"SST ({chr(176)}C)")
     ax.set_title(f"{label} — Basin-averaged SST")
     fig.autofmt_xdate()
-    fig.savefig(f"{prefix}_timeseries.png", dpi=150, bbox_inches="tight")
+    fig.savefig(fig_dir / "timeseries.png", dpi=150, bbox_inches="tight")
     plt.close(fig)
 
     # (4) Monthly climatology
@@ -643,87 +686,81 @@ def generate_figures(ds: xr.Dataset, label: str) -> None:
     ax.set_ylabel(f"SST ({chr(176)}C)")
     ax.set_title(f"{label} — Monthly Climatology")
     ax.set_xticks(range(1, 13))
-    fig.savefig(f"{prefix}_climatology.png", dpi=150, bbox_inches="tight")
+    fig.savefig(fig_dir / "monthly_cycle.png", dpi=150, bbox_inches="tight")
     plt.close(fig)
 
-    logger.info("  Figures saved to %s", FIGURES_DIR)
+    logger.info("  Figures saved to %s", fig_dir)
 
 
 # ===================================================================
-#  Main pipeline
+#  Main
 # ===================================================================
 
-def run_preprocessing_pipeline(source: str) -> xr.Dataset:
-    logger.info("")
-    logger.info("=" * 58)
-    logger.info("  Preprocessing pipeline  ---  %s", source.upper())
-    logger.info("=" * 58)
-
-    data_dir = SOURCE_DIR_MAP.get(source)
-    if data_dir is None:
-        raise ValueError(f"Unknown source '{source}'. Use: {list(SOURCE_DIR_MAP)}")
-
-    if source == "noaa":
-        ds = load_noaa_dataset()
-    else:
-        ds = load_cmip6_dataset(data_dir, source.upper())
-
-    _log_step("Validate time axis")
-    t1 = time.perf_counter()
-    ds = validate_time_axis(ds)
-    _log_done("Validate time axis", time.perf_counter() - t1)
-
-    dataset_summary(ds, source.upper())
-    return ds
-
-
-def main(sources: tuple[str, ...] | None = None) -> None:
+def main() -> None:
     overall_start = time.perf_counter()
     setup_logging()
 
-    if not sources:
-        src_list = ("noaa", "cmip6_historical")
+    _clean_old_merged_outputs()
+
+    logger.info("=" * 60)
+    logger.info("  START preprocess.py")
+    logger.info("=" * 60)
+
+    # ---- NOAA ----
+    noaa_processed = PROCESSED_DIR / "noaa_processed.nc"
+    if noaa_processed.exists():
+        logger.info("'noaa_processed.nc' already exists — skipping NOAA")
     else:
-        src_list = sources
-
-    valid_sources = [s for s in src_list if s in SOURCE_DIR_MAP]
-    skipped = [s for s in src_list if s not in SOURCE_DIR_MAP]
-    for s in skipped:
-        logger.warning("Unknown source '%s' — skipping. Known: %s", s, list(SOURCE_DIR_MAP))
-
-    if not valid_sources:
-        logger.error("No valid sources to process")
-        sys.exit(1)
-
-    logger.info("")
-    logger.info("  Preprocessing Pipeline  ---  %s", " + ".join(s.upper() for s in valid_sources))
-
-    for src in valid_sources:
-        data_dir = SOURCE_DIR_MAP[src]
-        if data_dir is None or not data_dir.exists():
-            logger.warning("Directory for '%s' does not exist (%s) — skipping", src, data_dir)
-            continue
-
-        processed_path = PROCESSED_DIR / f"{src}_processed.nc"
-        if processed_path.exists():
-            logger.info("'%s' already exists — skipping %s", processed_path.name, src)
-            continue
-
+        logger.info("")
+        logger.info("=" * 58)
+        logger.info("  Preprocessing NOAA OISST")
+        logger.info("=" * 58)
         t_src = time.perf_counter()
         try:
-            ds = run_preprocessing_pipeline(src)
-            save_dataset(ds, f"{src}_processed.nc")
-            generate_figures(ds, src)
-            elapsed = time.perf_counter() - t_src
-            logger.info("%s pipeline finished in %.1f s", src, elapsed)
+            ds_noaa = process_noaa()
+            ds_noaa = validate_time_axis(ds_noaa)
+            dataset_summary(ds_noaa, "NOAA OISST")
+            save_dataset(ds_noaa, "noaa_processed.nc")
+            generate_figures(ds_noaa, "noaa")
+            logger.info("NOAA finished in %.1f s", time.perf_counter() - t_src)
         except Exception as e:
-            logger.error("%s pipeline FAILED: %s", src, e)
+            logger.error("NOAA pipeline FAILED: %s", e)
             traceback.print_exc()
+
+    # ---- CMIP6 models (each independently) ----
+    if not CMIP6_DIR.exists():
+        logger.warning("CMIP6 directory does not exist: %s", CMIP6_DIR)
+    else:
+        models = discover_cmip6_models(CMIP6_DIR)
+        logger.info("")
+        logger.info("=" * 58)
+        logger.info("  Found %d CMIP6 model(s)", len(models))
+        logger.info("=" * 58)
+
+        for model_name, filepath in models:
+            out_name = f"{model_name}_processed.nc"
+            out_path = PROCESSED_DIR / out_name
+
+            if out_path.exists():
+                logger.info("'%s' already exists — skipping %s", out_name, model_name)
+                continue
+
+            t_model = time.perf_counter()
+            try:
+                ds = process_one_cmip6_model(model_name, filepath)
+                ds = validate_time_axis(ds)
+                dataset_summary(ds, model_name)
+                save_dataset(ds, out_name)
+                generate_figures(ds, model_name)
+                logger.info("%s finished in %.1f s", model_name, time.perf_counter() - t_model)
+                logger.info("  Finished %s", model_name)
+            except Exception as e:
+                logger.error("%s pipeline FAILED: %s", model_name, e)
+                traceback.print_exc()
 
     logger.info("")
     logger.info("  All done  ---  total time: %.1f s", time.perf_counter() - overall_start)
 
 
 if __name__ == "__main__":
-    args = tuple(sys.argv[1:]) if len(sys.argv) > 1 else ()
-    main(args if args else None)
+    main()
